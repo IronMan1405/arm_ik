@@ -9,7 +9,7 @@ from moveit_msgs.srv import GetCartesianPath
 
 class CartesianMoveClient(Node):
     def __init__(self):
-        super().__init__('cartesian_move_client')
+        super().__init__('cartesian_demo')
 
         self.cartesian_client = self.create_client(GetCartesianPath, '/compute_cartesian_path')
         self.exec_client = ActionClient(self, ExecuteTrajectory, '/execute_trajectory')
