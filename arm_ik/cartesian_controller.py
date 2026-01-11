@@ -23,7 +23,25 @@ class CartesianController(Node):
 
         self.get_logger().info('All MoveIt interfaces ready')
 
-        self.move_linear(0.0, 0.0, -0.05)
+        self.workspace = {
+            'x': (-1.65, 1.65),
+            'y': (-1.65, 1.65),
+            'z': (0.402, 2.05),
+        }
+
+        self.move_linear(0.0, 0.0, 0.05)
+
+    def within_workspace(self, pose: Pose) -> bool:
+        x, y, z = pose.position.x, pose.position.y, pose.position.z
+
+        if not (self.workspace['x'][0] <= x <= self.workspace['x'][1]):
+            return False
+        if not (self.workspace['y'][0] <= y <= self.workspace['y'][1]):
+            return False
+        if not (self.workspace['z'][0] <= z <= self.workspace['z'][1]):
+            return False
+        
+        return True
 
     def get_current_ee_pose(self):
         req = GetPositionFK.Request()
@@ -53,6 +71,14 @@ class CartesianController(Node):
         target_pose.position.y = start_pose.position.y + dy
         target_pose.position.z = start_pose.position.z + dz
         target_pose.orientation = start_pose.orientation
+
+        if not self.within_workspace(target_pose):
+            self.get_logger().error(
+                f'''Target pose out of workspace
+                x={target_pose.position.x:.2f}
+                y={target_pose.position.y:.2f}
+                z={target_pose.position.z:.2f}'''
+            )
 
         req = GetCartesianPath.Request()
         req.group_name = 'arm'
