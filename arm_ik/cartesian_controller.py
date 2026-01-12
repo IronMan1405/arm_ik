@@ -6,7 +6,7 @@ from geometry_msgs.msg import Pose
 from moveit_msgs.srv import GetCartesianPath, GetPositionFK
 from moveit_msgs.msg import RobotState
 from moveit_msgs.action import ExecuteTrajectory
-
+from trajectory_msgs.msg import JointTrajectory
 
 class CartesianController(Node):
     def __init__(self):
@@ -29,6 +29,9 @@ class CartesianController(Node):
             'z': (0.402, 2.05),
         }
 
+        self.velocity_scale = 0.3
+        self.accel_scale = 0.2
+
         self.move_linear(0.0, 0.0, 0.05)
 
     def within_workspace(self, pose: Pose) -> bool:
@@ -42,6 +45,18 @@ class CartesianController(Node):
             return False
         
         return True
+
+    def scale_trajectory(self, traj: JointTrajectory):
+        for point in traj.points:
+            if point.velocities:
+                point.velocities = [
+                    v * self.velocity_scale for v in point.velocities
+                ]
+
+            if point.accelerations:
+                point.accelerations = [
+                    a * self.accel_scale for a in point.accelerations
+                ]
 
     def get_current_ee_pose(self):
         req = GetPositionFK.Request()
@@ -105,6 +120,8 @@ class CartesianController(Node):
             rclpy.shutdown()
             return
         
+        self.scale_trajectory(res.solution.joint_trajectory)
+
         exec_goal = ExecuteTrajectory.Goal()
         exec_goal.trajectory = res.solution
 
