@@ -88,6 +88,7 @@ class CartesianController(Node):
 
         if self.current_exec_goal:
             self.current_exec_goal.cancel_goal_async()
+            self.exec_done_event.set()
 
     def execute_trajectory(self, traj: JointTrajectory):
         self.exec_done_event.clear()
@@ -159,6 +160,7 @@ class CartesianController(Node):
         req.fk_link_names = ['end_effector_link']
         req.robot_state = RobotState()
         req.robot_state.joint_state = self.current_joint_state
+        req.robot_state.is_diff = False
 
         future = self.fk_client.call_async(req)
         future.add_done_callback(self._on_fk_response)
@@ -189,8 +191,8 @@ class CartesianController(Node):
             self.get_logger().error('E-STOP active, aborting sequence')
             return
         
-        self.move_linear(0.1, 0.0, 0.0)
-        self.wait_for_execution()
+        # self.move_linear(0.1, 0.0, 0.0)
+        # self.wait_for_execution()
 
         self.move_linear(0.0, 0.0, -0.1)
         self.wait_for_execution()
@@ -216,6 +218,23 @@ class CartesianController(Node):
             return False
         
         return True
+    
+    def make_linear_waypoints(self, start: Pose, target: Pose, n_points: int = 20):
+        waypoints = []
+
+        for i in range(n_points + 1):
+            alpha = i / n_points
+
+            p = Pose()
+            p.position.x = start.position.x + alpha * (target.position.x - start.position.x)
+            p.position.y = start.position.y + alpha * (target.position.y - start.position.y)
+            p.position.z = start.position.z + alpha * (target.position.z - start.position.z)
+
+            p.orientation = start.orientation
+
+            waypoints.append(p)
+
+        return waypoints
 
     def scale_trajectory(self, traj: JointTrajectory):
         for point in traj.points:
@@ -240,6 +259,7 @@ class CartesianController(Node):
 
         if not self.within_workspace(target_pose):
             self.get_logger().error("Target pose out of workspace")
+            return
 
         req = GetCartesianPath.Request()
         req.group_name = 'arm'
@@ -250,12 +270,12 @@ class CartesianController(Node):
 
         req.start_state = RobotState()
         req.start_state.joint_state = self.current_joint_state
-        req.waypoints = [start_pose, target_pose]
+        req.waypoints = self.make_linear_waypoints(start_pose, target_pose, 25)
 
         self.get_logger().info(f'Planning Cartesian move: dx={dx}, dy={dy}, dz={dz}')
 
         future = self.cartesian_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+        future.add_done_callback(self._on_cartesian_response)
 
         res = future.result()
         self.get_logger().info(f'Cartesian fraction: {res.fraction:.2f}')
@@ -278,32 +298,37 @@ class CartesianController(Node):
 
         if not res or not res.pose_stamped:
             self.get_logger().error('FK failed')
+            self.fk_event.set()
             return
     
         self.last_fk_pose = res.pose_stamped[0].pose
         self.fk_event.set()
 
-    def cartesian_response_callback(self, future):
+    def _on_cartesian_response(self, future):
         if self.estop_active:
             return
         
-        res = future.result()
+        try:
+            res = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Cartesian Service failed: {e}")
+            return
 
         self.get_logger().info(f'Cartesian fraction: {res.fraction:.2f}')
 
         if res.fraction < 0.95:
             self.get_logger().error('Cartesian path incomplete - aborting')
-            rclpy.shutdown()
+            # rclpy.shutdown()
             return
         
         self.scale_trajectory(res.solution.joint_trajectory)
-
-        exec_goal = ExecuteTrajectory.Goal()
-        exec_goal.trajectory = res.solution
+        self.execute_trajectory(res.solution.joint_trajectory)
+        # exec_goal = ExecuteTrajectory.Goal()
+        # exec_goal.trajectory = res.solution
 
         self.get_logger().info('Executing Cartesian Trajectory...')
-        future = self.exec_client.send_goal_async(exec_goal)
-        future.add_done_callback(self._on_exec_result)
+        # future = self.exec_client.send_goal_async(exec_goal)
+        # future.add_done_callback(self._on_exec_result)
 
 
 def main():
