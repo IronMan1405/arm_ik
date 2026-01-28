@@ -9,6 +9,8 @@ from moveit_msgs.msg import RobotState, RobotTrajectory
 from moveit_msgs.action import ExecuteTrajectory
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from std_srvs.srv import Trigger
+
 import threading, sys, termios, tty
 
 HOME_JOINTS = {
@@ -24,15 +26,17 @@ class CartesianController(Node):
     def __init__(self):
         super().__init__('cartesian_controller')
 
-        self.estop_active = False
+        # self.estop_active = False
         self.current_joint_state = None
 
         self.exec_done_event = threading.Event()
         self.exec_result = None
-        self.current_exec_goal = None
+        # self.current_exec_goal = None
 
         self.fk_event = threading.Event()
         self.last_fk_pose = None
+
+        # self.motion_allowed = True
 
         self.create_subscription(JointState, '/joint_states', self.joint_state_cb, 10)
 
@@ -44,7 +48,10 @@ class CartesianController(Node):
         self.cartesian_client.wait_for_service()
         self.fk_client.wait_for_service()
         self.exec_client.wait_for_server()
-        self.get_logger().info('All MoveIt interfaces ready')
+        self.get_logger().info('Core MoveIt interfaces ready')
+
+        self.stop_client = self.create_client(Trigger, '/move_group/stop')
+        # self.stop_client.wait_for_service()
 
         self.workspace = {
             'x': (-1.65, 1.65),
@@ -57,7 +64,8 @@ class CartesianController(Node):
 
         threading.Thread(target=self.keyboard_listener, daemon=True).start()
 
-        self.get_logger().info('Controls: [SPACE]=E-STOP | [h]=HOME | [r]=RESET | [t]=TEST')
+        # self.get_logger().info('Controls: [SPACE]=E-STOP | [h]=HOME | [r]=RESET | [t]=TEST')
+        self.get_logger().info('Controls: [h]=HOME | [t]=TEST')
 
     def keyboard_listener(self):
         fd = sys.stdin.fileno()
@@ -68,12 +76,13 @@ class CartesianController(Node):
             while rclpy.ok():
                 key = sys.stdin.read(1)
 
-                if key == ' ':
-                    self.trigger_estop()
-                elif key == 'h':
+                # if key == ' ':
+                #     self.trigger_estop()
+                # elif key == 'h':
+                if key == 'h':
                     self.go_home()
-                elif key == 'r':
-                    self.reset_estop()
+                # elif key == 'r':
+                #     self.reset_estop()
                 elif key == 't':
                     self.test_cartesian_sequence()
         finally:
@@ -82,15 +91,44 @@ class CartesianController(Node):
     def joint_state_cb(self, msg: JointState):
         self.current_joint_state = msg
 
-    def trigger_estop(self):        
-        self.estop_active = True
-        self.get_logger().error("!!! EMERGENCY STOP ACTIVATED !!!")
+    # def trigger_estop(self):
+    #     self.estop_active = True
+    #     # self.motion_allowed = False
+        
+    #     self.get_logger().error("!!! EMERGENCY STOP ACTIVATED !!!")
 
-        if self.current_exec_goal:
-            self.current_exec_goal.cancel_goal_async()
-            self.exec_done_event.set()
+    #     if self.current_exec_goal:
+    #         self.current_exec_goal.cancel_goal_async()
+
+    #     # if self.stop_client.service_is_ready():
+    #     #     req = Trigger.Request()
+    #     #     self.stop_client.call_async(req)
+    #     # else:
+    #     if not self.stop_client.service_is_ready:
+    #         self.get_logger().error("MoveIt stop service not ready yet - retrying in 0.5s")
+    #         self.create_timer(0.5, self._retry_stop_service)
+    #         return
+        
+    #     req = Trigger.Request()
+    #     self.stop_client.call_async(req)
+        
+    #     # self.exec_done_event.set()
+
+    # def _retry_stop_service(self):
+    #     if self.stop_client.service_is_ready():
+    #         self.get_logger("Moveit stop service is now ready - sending stop command")
+    #         req = Trigger.Request()
+    #         self.stop_client.call_async(req)
+    #         return True
+    #     else:
+    #         self.get_logger().warn("still waiting for /move_group/stop...")
+    #         return False
 
     def execute_trajectory(self, traj: JointTrajectory):
+        # if not self.motion_allowed:
+        #     self.get_logger().error("Motion locked due to E-STOP")
+        #     return False
+        
         self.exec_done_event.clear()
 
         goal = ExecuteTrajectory.Goal()
@@ -121,9 +159,10 @@ class CartesianController(Node):
         self.exec_done_event.set()
 
     def go_home(self):
-        if self.estop_active:
-            self.get_logger().error('Cannot go home - E-STOP active')
-            return
+        # if self.estop_active:
+        # if not self.motion_allowed:
+        #     self.get_logger().error('Cannot go home - E-STOP active')
+        #     return
 
         if self.current_joint_state is None:
             self.get_logger().error('No joint state')
@@ -187,9 +226,10 @@ class CartesianController(Node):
         return True
     
     def test_cartesian_sequence(self):
-        if self.estop_active:
-            self.get_logger().error('E-STOP active, aborting sequence')
-            return
+        # if self.estop_active:
+        # if not self.motion_allowed:
+        #     self.get_logger().error('E-STOP active, aborting sequence')
+        #     return
         
         # self.move_linear(0.1, 0.0, 0.0)
         # self.wait_for_execution()
@@ -203,9 +243,10 @@ class CartesianController(Node):
     def get_current_joint_state(self):
         return self.current_joint_state
 
-    def reset_estop(self):
-        self.estop_active = False
-        self.get_logger().info('E-STOP cleared')
+    # def reset_estop(self):
+    #     self.estop_active = False
+    #     self.motion_allowed = True
+    #     self.get_logger().info('E-STOP cleared')
 
     def within_workspace(self, pose: Pose) -> bool:
         x, y, z = pose.position.x, pose.position.y, pose.position.z
@@ -245,8 +286,12 @@ class CartesianController(Node):
                 point.accelerations = [a * self.accel_scale for a in point.accelerations]
     
     def move_linear(self, dx, dy, dz):
-        if self.estop_active:
-            return
+        # if not self.motion_allowed:
+        #     self.get_logger().error("Motion locked due to E-STOP")
+        #     return
+        
+        # if self.estop_active:
+        #     return
 
         start_pose = self.get_current_ee_pose()
         if start_pose is None:
@@ -276,17 +321,17 @@ class CartesianController(Node):
 
         future = self.cartesian_client.call_async(req)
         future.add_done_callback(self._on_cartesian_response)
+        # rclpy.spin_until_future_complete(self, future)
+        # res = future.result()
+        # self.get_logger().info(f'Cartesian fraction: {res.fraction:.2f}')
 
-        res = future.result()
-        self.get_logger().info(f'Cartesian fraction: {res.fraction:.2f}')
+        # if res.fraction < 0.95:
+        #     self.get_logger().error('Cartesian path incomplete - aborting')
+        #     return
 
-        if res.fraction < 0.95:
-            self.get_logger().error('Cartesian path incomplete - aborting')
-            return
+        # self.scale_trajectory(res.solution.joint_trajectory)
 
-        self.scale_trajectory(res.solution.joint_trajectory)
-
-        self.execute_trajectory(res.solution.joint_trajectory)
+        # self.execute_trajectory(res.solution.joint_trajectory)
 
     def _on_fk_response(self, future):
         try:
@@ -305,8 +350,8 @@ class CartesianController(Node):
         self.fk_event.set()
 
     def _on_cartesian_response(self, future):
-        if self.estop_active:
-            return
+        # if self.estop_active:
+        #     return
         
         try:
             res = future.result()
@@ -327,8 +372,6 @@ class CartesianController(Node):
         # exec_goal.trajectory = res.solution
 
         self.get_logger().info('Executing Cartesian Trajectory...')
-        # future = self.exec_client.send_goal_async(exec_goal)
-        # future.add_done_callback(self._on_exec_result)
 
 
 def main():

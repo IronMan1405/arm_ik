@@ -1,4 +1,0 @@
-geometry_msgs/Pose target_pose
----
-float64[] joint_positions
-bool success
