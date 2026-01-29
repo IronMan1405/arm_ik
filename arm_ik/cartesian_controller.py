@@ -50,7 +50,7 @@ class CartesianController(Node):
         self.exec_client.wait_for_server()
         self.get_logger().info('Core MoveIt interfaces ready')
 
-        self.stop_client = self.create_client(Trigger, '/move_group/stop')
+        # self.stop_client = self.create_client(Trigger, '/move_group/stop')
         # self.stop_client.wait_for_service()
 
         self.workspace = {
@@ -61,6 +61,9 @@ class CartesianController(Node):
 
         self.velocity_scale = 0.3
         self.accel_scale = 0.2
+
+        self.cartesian_event = threading.Event()
+        self.last_cartesian_res = None
 
         threading.Thread(target=self.keyboard_listener, daemon=True).start()
 
@@ -84,7 +87,8 @@ class CartesianController(Node):
                 # elif key == 'r':
                 #     self.reset_estop()
                 elif key == 't':
-                    self.test_cartesian_sequence()
+                    # self.test_cartesian_sequence()
+                    self.test_segmented_cartesian()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -368,10 +372,111 @@ class CartesianController(Node):
         
         self.scale_trajectory(res.solution.joint_trajectory)
         self.execute_trajectory(res.solution.joint_trajectory)
-        # exec_goal = ExecuteTrajectory.Goal()
-        # exec_goal.trajectory = res.solution
+
 
         self.get_logger().info('Executing Cartesian Trajectory...')
+
+    def execute_cartesian_segmented(self, target_pose, step_size=0.02, eef_step=0.005, jump_threshold=0.0, min_fraction=0.90):
+        start_pose = self.get_current_ee_pose()
+        if start_pose is None:
+            return False
+
+        dx = target_pose.position.x - start_pose.position.x
+        dy = target_pose.position.y - start_pose.position.y
+        dz = target_pose.position.z - start_pose.position.z
+
+        dist = (dx**2 + dy**2 + dz**2) ** 0.5
+        num_segments = max(1, int(dist/step_size))
+
+        self.get_logger().info(f"Segmented Cartesian move: {num_segments} segments")
+
+        for i in range(1, num_segments + 1):
+            ratio = i / num_segments
+
+            intermediate_pose = Pose()
+            intermediate_pose.position.x = start_pose.position.x + dx * ratio
+            intermediate_pose.position.y = start_pose.position.y + dy * ratio
+            intermediate_pose.position.z = start_pose.position.z + dz * ratio
+            intermediate_pose.orientation = start_pose.orientation
+            
+            req = GetCartesianPath.Request()
+            req.group_name = 'arm'
+            req.link_name = 'end_effector_link'
+            req.max_step = eef_step
+            req.jump_threshold = jump_threshold
+            req.avoid_collisions = True
+
+            req.start_state = RobotState()
+            req.start_state.joint_state = self.current_joint_state
+            req.waypoints = [intermediate_pose]
+
+            self.cartesian_event.clear()
+            future = self.cartesian_client.call_async(req)
+            future.add_done_callback(self._on_segment_cartesian_response)
+
+            # res = future.result()
+            if not self.cartesian_event.wait(2.0):
+                self.get_logger().error(f"Segment {i}: Cartesian service failed")
+                return False
+            
+            res = self.last_cartesian_res
+
+            if res is None:
+                self.get_logger().error(f"Segment {i}: Cartesian service failed - no result")
+                return False
+
+            self.get_logger().info(f"[Segment {i}/{num_segments}] Cartesian fraction: {res.fraction:.2f}")
+
+            if res.fraction == 0.0:
+                self.get_logger().error(f"Cartesian planning failed at segment {i}")
+                return False
+            
+            self.scale_trajectory(res.solution.joint_trajectory)
+            self.execute_trajectory(res.solution.joint_trajectory)
+            self.wait_for_execution()
+
+            start_pose = self.get_current_ee_pose()
+            if start_pose is None:
+                return False
+
+            # dx_current = current_pose.position.x - intermediate_pose.position.x
+            # dy_current = current_pose.position.y - intermediate_pose.position.y
+            # dz_current = current_pose.position.z - intermediate_pose.position.z
+
+            # current_dist = (dx_current**2 + dy_current**2 + dz_current**2) ** 0.5
+
+            # if current_dist == 0:
+            #     self.get_logger().info(f"[Segment {i}/{num_segments}] ee reached intermediate pose")
+            #     continue
+            # else:
+            #     self.get_logger().error("ee could not reach the intermediate pose")
+            #     return False
+
+        self.get_logger().info("Segmented Cartesian motion complete!")
+        return True
+    
+    def _on_segment_cartesian_response(self, future):
+        try:
+            self.last_cartesian_res = future.result()
+        except Exception as e:
+            self.get_logger().error(f"Cartesian service failed: {e}")
+            self.last_cartesian_res = None
+        finally:
+            self.cartesian_event.set()
+
+    def test_segmented_cartesian(self):
+        start_pose = self.get_current_ee_pose()
+        if start_pose is None:
+            return
+
+        target = Pose()
+        target.position.x = start_pose.position.x + 0.015
+        target.position.y = start_pose.position.y
+        target.position.z = start_pose.position.z - 0.005
+
+        target.orientation = start_pose.orientation
+        
+        self.execute_cartesian_segmented(target)
 
 
 def main():
