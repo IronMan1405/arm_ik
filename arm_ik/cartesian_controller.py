@@ -54,9 +54,9 @@ class CartesianController(Node):
         # self.stop_client.wait_for_service()
 
         self.workspace = {
-            'x': (-1.65, 1.65),
-            'y': (-1.65, 1.65),
-            'z': (0.402, 2.05),
+            'x': (-0.3575, 0.3575),
+            'y': (-0.3575, 0.3575),
+            'z': (0.095331, 0.4525),
         }
 
         self.velocity_scale = 0.3
