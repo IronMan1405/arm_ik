@@ -4,14 +4,16 @@ from rclpy.action import ActionClient
 
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint
+from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes
 from shape_msgs.msg import SolidPrimitive
 
-X_MIN, X_MAX = -1.65, 1.65
-Y_MIN, Y_MAX = -1.65, 1.65
-Z_MIN, Z_MAX = 0.402, 2.05
 
-def is_reachable(p):
+# not true reachability limits, they just filter out obviously impossible targets
+X_MIN, X_MAX = -0.3575, 0.3575
+Y_MIN, Y_MAX = -0.3575, 0.3575
+Z_MIN, Z_MAX = 0.095331, 0.4525
+
+def is_plausible_target(p):
     return (
         X_MIN <= p.x <= X_MAX and
         Y_MIN <= p.y <= Y_MAX and
@@ -26,9 +28,9 @@ class IKMoveClient(Node):
         self.get_logger().info('Waiting for MoveGroup action server...')
         self.client.wait_for_server()
 
-        self.send_pose_goal()
+        self.move_to(z=0.3835, tol=0.05, constrain_orientation=True)
 
-    def send_pose_goal(self):
+    def move_to(self, x=None, y=None, z=None, tol=0.05, constrain_orientation=False):
         goal = MoveGroup.Goal()
 
         goal.request.group_name = 'arm'
@@ -39,13 +41,13 @@ class IKMoveClient(Node):
 
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
-        pose.pose.position.x = 0.45
-        pose.pose.position.y = 0.33
-        pose.pose.position.z = 1.9
+        pose.pose.position.x = x if x is not None else 0.0
+        pose.pose.position.y = y if y is not None else 0.0
+        pose.pose.position.z = z if z is not None else 0.0
         pose.pose.orientation.w = 1.0
 
-        if not is_reachable(pose.pose.position):
-            self.get_logger().error('Target pose is outside reachable workspace')
+        if not is_plausible_target(pose.pose.position):
+            self.get_logger().error('Target pose is outside plausible workspace')
             return
 
         pose_constraint = PositionConstraint()
@@ -54,24 +56,27 @@ class IKMoveClient(Node):
 
         primitive = SolidPrimitive()
         primitive.type = SolidPrimitive.BOX
-        primitive.dimensions = [0.05, 0.05, 0.05]
+        primitive.dimensions = [tol, tol, tol]
 
         pose_constraint.constraint_region.primitives.append(primitive)
         pose_constraint.constraint_region.primitive_poses.append(pose.pose)
         pose_constraint.weight = 1.0
 
-        # ori_constraint = OrientationConstraint()
-        # ori_constraint.header = pose.header
-        # ori_constraint.link_name = 'end_effector_link'
-        # ori_constraint.orientation = pose.pose.orientation
-        # ori_constraint.absolute_x_axis_tolerance = 0.1
-        # ori_constraint.absolute_y_axis_tolerance = 0.1
-        # ori_constraint.absolute_z_axis_tolerance = 0.1
-        # ori_constraint.weight = 1.0
 
         constraints = Constraints()
         constraints.position_constraints.append(pose_constraint)
-        # constraints.orientation_constraints.append(ori_constraint)
+
+        if constrain_orientation:
+            ori_constraint = OrientationConstraint()
+            ori_constraint.header = pose.header
+            ori_constraint.link_name = 'end_effector_link'
+            ori_constraint.orientation = pose.pose.orientation
+            ori_constraint.absolute_x_axis_tolerance = 0.2
+            ori_constraint.absolute_y_axis_tolerance = 0.2
+            ori_constraint.absolute_z_axis_tolerance = 0.2
+            ori_constraint.weight = 1.0
+            constraints.orientation_constraints.append(ori_constraint)
+
 
         goal.request.goal_constraints.append(constraints)
 
@@ -97,14 +102,23 @@ class IKMoveClient(Node):
 
     def result_callback(self, future):
         result = future.result().result
-        self.get_logger().info(f'Execution Result: {result.error_code.val}')
+        code = result.error_code.val
+
+        if code == MoveItErrorCodes.SUCCESS:
+            self.get_logger().info("Motion succeeded")
+        elif code == MoveItErrorCodes.NO_IK_SOLUTION:
+            self.get_logger().error("No IK Solution found")
+        elif code == MoveItErrorCodes.PLANNING_FAILED:
+            self.get_logger().error("Planning failed")
+        else:
+            self.get_logger().info(f'Execution Result: {code}')
+        
         rclpy.shutdown()
 
 def main():
     rclpy.init()
     node = IKMoveClient()
     rclpy.spin(node)
-    # rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
