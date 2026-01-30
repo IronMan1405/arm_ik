@@ -7,6 +7,7 @@ from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes
 from shape_msgs.msg import SolidPrimitive
 
+import sys, termios, tty, select
 
 # not true reachability limits, they just filter out obviously impossible targets
 X_MIN, X_MAX = -0.3575, 0.3575
@@ -24,11 +25,90 @@ class IKMoveClient(Node):
     def __init__(self):
         super().__init__('ik_move_client')
 
+        self.named_poses = {
+            "home" : dict(x=0.0032001789659261703, y=-1.795403477444779e-05, z=0.4174376428127289),
+        }
+
         self.client = ActionClient(self, MoveGroup, '/move_action')
         self.get_logger().info('Waiting for MoveGroup action server...')
         self.client.wait_for_server()
 
-        self.move_to(z=0.3835, tol=0.05, constrain_orientation=True)
+        # self.move_to(z=0.3835, tol=0.05, constrain_orientation=True)
+        self.go_named_pose("home")
+        self.keyboard_teleop()
+
+    def get_key(self, timeout=0.1):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            tty.setraw(fd)
+            rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+            if rlist:
+                return sys.stdin.read(1)
+            return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def keyboard_teleop(self):
+        self.get_logger().info(
+            "\nKeyboard control:\n"
+            "W/S -> +X/-X\n"
+            "A/D -> +Y/-Y\n"
+            "Q/E -> +Z/-Z\n"
+            "H -> home\n"
+            "X -> exit\n"
+            "C -> enable/disable orientation constaint"
+        )
+
+        self.target = dict(x=0.0032001789659261703, y=-1.795403477444779e-05, z=0.4174376428127289) # home
+
+        step = 0.02
+
+        while rclpy.ok():
+            key = self.get_key()
+            if key is None:
+                continue
+
+            moved = False
+            constrained = False
+            
+            if key == "w":
+                self.target["x"] += step
+                moved = True
+            if key == "s":
+                self.target["x"] -= step
+                moved = True
+            if key == "a":
+                self.target["y"] += step
+                moved = True
+            if key == "d":
+                self.target["y"] -= step
+                moved = True
+            if key == "q":
+                self.target["z"] += step
+                moved = True
+            if key == "e":
+                self.target["z"] -= step
+                moved = True
+            if key == "h":
+                self.go_named_pose("home")
+                self.target = self.named_poses["home"].copy()
+                continue
+            if key == 'x':
+                self.get_logger().info("exiting teleop")
+                break
+            if key == 'c':
+                if constrained:
+                    self.get_logger().info("Enabled orientation constraint.")
+                else:
+                    self.get_logger().info("Disabled orientation constraint.")
+
+            if moved:
+                self.get_logger().info(
+                    f"Target: x={self.target['x']:.3f}, y={self.target['y']:.3f}, z={self.target['z']:.3f}"
+                )
+                self.move_to(x=self.target["x"], y=self.target["y"], z=self.target["z"], tol=0.05, constrain_orientation=constrained)
 
     def move_to(self, x=None, y=None, z=None, tol=0.05, constrain_orientation=False):
         goal = MoveGroup.Goal()
@@ -36,8 +116,8 @@ class IKMoveClient(Node):
         goal.request.group_name = 'arm'
         goal.request.num_planning_attempts = 5
         goal.request.allowed_planning_time = 5.0
-        goal.request.max_velocity_scaling_factor = 0.3
-        goal.request.max_acceleration_scaling_factor = 0.3
+        goal.request.max_velocity_scaling_factor = 1.0 # 0.3
+        goal.request.max_acceleration_scaling_factor = 1.0 # 0.3
 
         pose = PoseStamped()
         pose.header.frame_id = 'base_link'
@@ -84,6 +164,15 @@ class IKMoveClient(Node):
         # self._action_client.send_goal_async(goal)
         self._send_goal_future = self.client.send_goal_async(goal, feedback_callback=self.feedback_callback)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def go_named_pose(self, name, tol=0.05):
+        if name not in self.named_poses:
+            self.get_logger().error(f"Unknown named pose: {name}")
+            return
+        
+        p = self.named_poses[name]
+        self.get_logger().info(f"Going to named pose: {name}")
+        self.move_to(x=p["x"], y=p["y"], z=p["z"], tol=tol, constrain_orientation=True)
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
