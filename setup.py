@@ -28,7 +28,8 @@ setup(
             'ik_service = arm_ik.ik_service:main',
             'ik_move_client = arm_ik.ik_move_client:main',
             'cartesian_demo = arm_ik.cartesian_demo:main',
-            'cartesian_controller = arm_ik.cartesian_controller:main'
+            'cartesian_controller = arm_ik.cartesian_controller:main',
+            'ik_move_node = arm_ik.ik_move_node:main',
         ],
     },
 )
