@@ -5,7 +5,8 @@ from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped, Vector3
 from std_msgs.msg import Bool, String
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes
+from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes, RobotState
+from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
@@ -32,40 +33,44 @@ class IKMoveNode(Node):
         self.get_logger().info('Waiting for MoveGroup action server...')
         self.client.wait_for_server()
 
+        self.fk_client = self.create_client(GetPositionFK, '/compute_fk')
+        self.get_logger().info('Waiting for FK service...')
+        self.fk_client.wait_for_service()
+
         self.create_subscription(Vector3, "/arm/teleop_delta", self.delta_callback, 10)
         self.create_subscription(Bool, "/arm/orientation_constraint", self.orientation_callback, 10)
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
 
-        self.joint_pub = self.create_publisher(JointState, "/arm/joint_targets", 10)
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
+        
         self.named_poses = {
             'home' : PoseStamped(header=self.make_header(),pose=self.make_pose(0.0032001789659261703, -1.795403477444779e-05, 0.4174376428127289)),
         }
 
         self.named_joint_poses = {
             'zero' : {
-                'joint_1': 0.0,
-                'joint_2': 0.0,
-                'joint_3': 0.0,
-                'joint_4': 0.0,
-                'joint_5': 0.0,
+                'joint1': 0.0,
+                'joint2': 0.0,
+                'joint3': 0.0,
+                'joint4': 0.0,
+                'joint5': 0.0,
                 },
             'front' : {
-                'joint_1': 0.0,
-                'joint_2': 0.35,
-                'joint_3': 0.7,
-                'joint_4': 0.5,
-                'joint_5': 0.0,
+                'joint1': 0.0,
+                'joint2': 0.35,
+                'joint3': 0.7,
+                'joint4': 0.5,
+                'joint5': 0.0,
             },
             'back' : {
-                'joint_1': 0.0,
-                'joint_2': -0.35,
-                'joint_3': -0.7,
-                'joint_4': -0.5,
-                'joint_5': 0.0,
+                'joint1': 0.0,
+                'joint2': -0.35,
+                'joint3': -0.7,
+                'joint4': -0.5,
+                'joint5': 0.0,
             }
         }
 
@@ -95,28 +100,55 @@ class IKMoveNode(Node):
         name = msg.data
         
         if name in self.named_poses:
-            import copy
             # self.target_pose = self.named_poses[msg.data]
+            import copy
             self.target_pose = copy.deepcopy(self.named_poses[msg.data])
             self.send_ik_goal(self.target_pose)
             return
         
         if name in self.named_joint_poses:
-            self.publish_joint_pose(self.named_joint_poses[name])
+            self.joint_pose_to_fk_and_plan(self.named_joint_poses[name])
+            return
         
         if name not in self.named_poses and name not in self.named_joint_poses:
             self.get_logger().warn(f"Unknown named pose: {name}")
             return
 
-    def publish_joint_pose(self, joint_map):
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = list(joint_map.keys())
-        msg.position = list(joint_map.values())
+    # def publish_joint_pose(self, joint_map):
+    #     msg = JointState()
+    #     msg.header.stamp = self.get_clock().now().to_msg()
+    #     msg.name = list(joint_map.keys())
+    #     msg.position = list(joint_map.values())
 
-        self.joint_pub.publish(msg)
-        self.get_logger().info(f"Published joint pose: {joint_map}")
+    #     self.joint_pub.publish(msg)
+    #     self.get_logger().info(f"Published joint pose: {joint_map}")
 
+    def joint_pose_to_fk_and_plan(self, joint_map):
+        req = GetPositionFK.Request()
+        req.header.frame_id = 'base_link'
+        req.fk_link_names = ['end_effector_link']
+        req.robot_state = RobotState()
+        req.robot_state.joint_state.name = list(joint_map.keys())
+        req.robot_state.joint_state.position = list(joint_map.values())
+        req.robot_state.is_diff = False
+
+        future = self.fk_client.call_async(req)
+        future.add_done_callback(self.fk_callback)
+
+    def fk_callback(self, future):
+        res = future.result()
+
+        if not res or not res.pose_stamped:
+            self.get_logger().warn("FK failed")
+            return
+        
+        pose = res.pose_stamped[0]
+
+        if not is_plausible_target(pose.pose.position):
+            self.get_logger().warn("FK pose outside workspace, ignoring")
+            return
+        
+        self.send_ik_goal(pose)
     
     def send_ik_goal(self, pose: PoseStamped):
         pose.header.stamp = self.get_clock().now().to_msg()
@@ -126,8 +158,8 @@ class IKMoveNode(Node):
         goal.request.group_name = 'arm'
         goal.request.num_planning_attempts = 5
         goal.request.allowed_planning_time = 5.0
-        goal.request.max_velocity_scaling_factor = 0.5 # 0.3
-        goal.request.max_acceleration_scaling_factor = 0.5 # 0.3
+        goal.request.max_velocity_scaling_factor = 0.5
+        goal.request.max_acceleration_scaling_factor = 0.5
 
         pose_constraint = PositionConstraint()
         pose_constraint.header = pose.header
