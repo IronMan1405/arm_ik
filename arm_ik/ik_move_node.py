@@ -8,6 +8,7 @@ from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory
 
 import time
 
@@ -36,6 +37,7 @@ class IKMoveNode(Node):
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
 
         self.joint_pub = self.create_publisher(JointState, "/arm/joint_targets", 10)
+        self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
@@ -187,27 +189,9 @@ class IKMoveNode(Node):
         if not result.planned_trajectory.joint_trajectory.points:
             self.get_logger().info("Empty trajectory")
             return
-        
-        point = trajectory.points[-1]
 
-        # msg = JointState()
-        # msg.header.stamp = self.get_clock().now().to_msg()
-        # msg.name = trajectory.joint_names
-        # msg.position = list(point.positions)
-
-        # self.joint_pub.publish(msg)
-        # self.get_logger().info(f"published joint targets: {msg.position}")
-
-        for point in trajectory.points:
-            msg = JointState()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.name = trajectory.joint_names
-            msg.position = list(point.positions)
-
-            self.joint_pub.publish(msg)
-            self.get_logger().info(f"published joint targets: {msg.position}")
-            time.sleep(0.05)  # ~20 Hz execution
-
+        self.traj_pub.publish(trajectory)
+        self.get_logger().info("Published joint trajectory")
 
     def get_current_pose(self):
         ps = PoseStamped()
