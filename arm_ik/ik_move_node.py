@@ -7,8 +7,9 @@ from std_msgs.msg import Bool, String
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes
 from shape_msgs.msg import SolidPrimitive
+from sensor_msgs.msg import JointState
 
-import sys, termios, tty, select
+import time
 
 # not true reachability limits, they just filter out obviously impossible targets
 X_MIN, X_MAX = -0.3575, 0.3575
@@ -34,10 +35,36 @@ class IKMoveNode(Node):
         self.create_subscription(Bool, "/arm/orientation_constraint", self.orientation_callback, 10)
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
 
+        self.joint_pub = self.create_publisher(JointState, "/arm/joint_targets", 10)
+
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
         self.named_poses = {
-            'home' : PoseStamped(header=self.make_header(),pose=self.make_pose(0.0032001789659261703, -1.795403477444779e-05, 0.4174376428127289))
+            'home' : PoseStamped(header=self.make_header(),pose=self.make_pose(0.0032001789659261703, -1.795403477444779e-05, 0.4174376428127289)),
+        }
+
+        self.named_joint_poses = {
+            'zero' : {
+                'joint_1': 0.0,
+                'joint_2': 0.0,
+                'joint_3': 0.0,
+                'joint_4': 0.0,
+                'joint_5': 0.0,
+                },
+            'front' : {
+                'joint_1': 0.0,
+                'joint_2': 0.35,
+                'joint_3': 0.7,
+                'joint_4': 0.5,
+                'joint_5': 0.0,
+            },
+            'back' : {
+                'joint_1': 0.0,
+                'joint_2': -0.35,
+                'joint_3': -0.7,
+                'joint_4': -0.5,
+                'joint_5': 0.0,
+            }
         }
 
         self.get_logger().info("IK Move Node ready")
@@ -63,22 +90,42 @@ class IKMoveNode(Node):
         self.get_logger().info(f"Orientation constraint {state}")
 
     def named_pose_callback(self, msg: String):
-        if msg.data not in self.named_poses:
-            self.get_logger().warn(f"Unknown named pose: {msg.data}")
+        name = msg.data
+        
+        if name in self.named_poses:
+            import copy
+            # self.target_pose = self.named_poses[msg.data]
+            self.target_pose = copy.deepcopy(self.named_poses[msg.data])
+            self.send_ik_goal(self.target_pose)
             return
         
-        self.target_pose = self.named_poses[msg.data]
-        self.send_ik_goal(self.target_pose)
+        if name in self.named_joint_poses:
+            self.publish_joint_pose(self.named_joint_poses[name])
+        
+        if name not in self.named_poses and name not in self.named_joint_poses:
+            self.get_logger().warn(f"Unknown named pose: {name}")
+            return
+
+    def publish_joint_pose(self, joint_map):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(joint_map.keys())
+        msg.position = list(joint_map.values())
+
+        self.joint_pub.publish(msg)
+        self.get_logger().info(f"Published joint pose: {joint_map}")
 
     
     def send_ik_goal(self, pose: PoseStamped):
+        pose.header.stamp = self.get_clock().now().to_msg()
+
         goal = MoveGroup.Goal()
 
         goal.request.group_name = 'arm'
         goal.request.num_planning_attempts = 5
         goal.request.allowed_planning_time = 5.0
-        goal.request.max_velocity_scaling_factor = 1.0 # 0.3
-        goal.request.max_acceleration_scaling_factor = 1.0 # 0.3
+        goal.request.max_velocity_scaling_factor = 0.5 # 0.3
+        goal.request.max_acceleration_scaling_factor = 0.5 # 0.3
 
         pose_constraint = PositionConstraint()
         pose_constraint.header = pose.header
@@ -111,7 +158,56 @@ class IKMoveNode(Node):
         goal.request.goal_constraints.append(constraints)
 
         self.get_logger().info('Sending IK + planning goal...')
-        self.client.send_goal_async(goal)
+        send_future = self.client.send_goal_async(goal)
+        send_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().warn("IK goal rejected")
+            return
+
+        self.get_logger().info("IK goal accepted, waiting for result...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.ik_result_callback)
+
+    def ik_result_callback(self, future):
+        result = future.result().result
+        if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            self.get_logger().warn(f"IK planning failed with code {result.error_code.val}")
+            return
+        
+        trajectory = result.planned_trajectory.joint_trajectory
+
+        if not trajectory.points:
+            self.get_logger().warn("empty trajectory")
+            return
+
+        if not result.planned_trajectory.joint_trajectory.points:
+            self.get_logger().info("Empty trajectory")
+            return
+        
+        point = trajectory.points[-1]
+
+        # msg = JointState()
+        # msg.header.stamp = self.get_clock().now().to_msg()
+        # msg.name = trajectory.joint_names
+        # msg.position = list(point.positions)
+
+        # self.joint_pub.publish(msg)
+        # self.get_logger().info(f"published joint targets: {msg.position}")
+
+        for point in trajectory.points:
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.name = trajectory.joint_names
+            msg.position = list(point.positions)
+
+            self.joint_pub.publish(msg)
+            self.get_logger().info(f"published joint targets: {msg.position}")
+            time.sleep(0.05)  # ~20 Hz execution
+
 
     def get_current_pose(self):
         ps = PoseStamped()
