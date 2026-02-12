@@ -42,6 +42,10 @@ class IKMoveNode(Node):
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
 
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
+        self.state_pub = self.create_publisher(String, "/arm/execution_state", 10)
+
+        self.execution_state = "IDLE"
+        self.publish_state()
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
@@ -75,6 +79,11 @@ class IKMoveNode(Node):
         }
 
         self.get_logger().info("IK Move Node ready")
+
+    def publish_state(self):
+        msg = String()
+        msg.data = self.execution_state
+        self.state_pub.publish(msg)
 
     def delta_callback(self, msg: Vector3):
         if self.target_pose is None:
@@ -199,9 +208,13 @@ class IKMoveNode(Node):
         goal_handle = future.result()
 
         if not goal_handle.accepted:
+            self.execution_state = "FAILED"
+            self.publish_state()
             self.get_logger().warn("IK goal rejected")
             return
 
+        self.execution_state = "EXECUTING"
+        self.publish_state()
         self.get_logger().info("IK goal accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self.ik_result_callback)
@@ -209,19 +222,27 @@ class IKMoveNode(Node):
     def ik_result_callback(self, future):
         result = future.result().result
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            self.execution_state = "FAILED"
+            self.publish_state()
             self.get_logger().warn(f"IK planning failed with code {result.error_code.val}")
             return
         
         trajectory = result.planned_trajectory.joint_trajectory
 
         if not trajectory.points:
+            self.execution_state = "FAILED"
+            self.publish_state()
             self.get_logger().warn("empty trajectory")
             return
 
         if not result.planned_trajectory.joint_trajectory.points:
+            self.execution_state = "FAILED"
+            self.publish_state()
             self.get_logger().info("Empty trajectory")
             return
 
+        self.execution_state = "SUCCEEDED"
+        self.publish_state()
         self.traj_pub.publish(trajectory)
         self.get_logger().info("Published joint trajectory")
 
