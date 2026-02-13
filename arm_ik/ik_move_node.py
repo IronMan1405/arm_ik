@@ -12,6 +12,8 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
 
 import time
+from collections import deque
+
 
 # not true reachability limits, they just filter out obviously impossible targets
 X_MIN, X_MAX = -0.3575, 0.3575
@@ -49,6 +51,10 @@ class IKMoveNode(Node):
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
+
+        self.command_queue = deque()
+        self.busy = False
+        self.create_timer(0.05, self.process_queue)
         
         self.named_poses = {
             'home' : PoseStamped(header=self.make_header(),pose=self.make_pose(0.0032001789659261703, -1.795403477444779e-05, 0.4174376428127289)),
@@ -80,6 +86,20 @@ class IKMoveNode(Node):
 
         self.get_logger().info("IK Move Node ready")
 
+    def process_queue(self):
+        if self.busy:
+            return
+        if not self.command_queue:
+            return
+        
+        cmd_type, data = self.command_queue.popleft()
+        self.busy = True
+
+        if cmd_type == "pose":
+            self.send_ik_goal(data)
+        if cmd_type == "joint":
+            self.joint_pose_to_fk_and_plan(data)
+
     def publish_state(self):
         msg = String()
         msg.data = self.execution_state
@@ -97,7 +117,9 @@ class IKMoveNode(Node):
             self.get_logger().warn("Target outside workspace, ignoring")
             return
         
-        self.send_ik_goal(self.target_pose)
+        # self.send_ik_goal(self.target_pose)
+        import copy
+        self.command_queue.append(("pose", copy.deepcopy(self.target_pose)))
 
     def orientation_callback(self, msg: Bool):
         self.orientation_enabled = msg.data
@@ -112,11 +134,13 @@ class IKMoveNode(Node):
             # self.target_pose = self.named_poses[msg.data]
             import copy
             self.target_pose = copy.deepcopy(self.named_poses[msg.data])
-            self.send_ik_goal(self.target_pose)
+            # self.send_ik_goal(self.target_pose)
+            self.command_queue.append(("pose", self.target_pose))
             return
         
         if name in self.named_joint_poses:
-            self.joint_pose_to_fk_and_plan(self.named_joint_poses[name])
+            # self.joint_pose_to_fk_and_plan(self.named_joint_poses[name])
+            self.command_queue.append(("joint", self.named_joint_poses[name]))
             return
         
         if name not in self.named_poses and name not in self.named_joint_poses:
@@ -157,7 +181,9 @@ class IKMoveNode(Node):
             self.get_logger().warn("FK pose outside workspace, ignoring")
             return
         
-        self.send_ik_goal(pose)
+        # self.send_ik_goal(pose)
+        self.command_queue.appendleft(("pose", pose))
+        self.busy = False
     
     def send_ik_goal(self, pose: PoseStamped):
         pose.header.stamp = self.get_clock().now().to_msg()
@@ -225,6 +251,7 @@ class IKMoveNode(Node):
             self.execution_state = "FAILED"
             self.publish_state()
             self.get_logger().warn(f"IK planning failed with code {result.error_code.val}")
+            self.busy = False
             return
         
         trajectory = result.planned_trajectory.joint_trajectory
@@ -233,18 +260,22 @@ class IKMoveNode(Node):
             self.execution_state = "FAILED"
             self.publish_state()
             self.get_logger().warn("empty trajectory")
+            self.busy = False
             return
 
         if not result.planned_trajectory.joint_trajectory.points:
             self.execution_state = "FAILED"
             self.publish_state()
             self.get_logger().info("Empty trajectory")
+            self.busy = False
             return
 
         self.execution_state = "SUCCEEDED"
         self.publish_state()
         self.traj_pub.publish(trajectory)
         self.get_logger().info("Published joint trajectory")
+        
+        self.busy = False
 
     def get_current_pose(self):
         ps = PoseStamped()
