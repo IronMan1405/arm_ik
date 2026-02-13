@@ -12,7 +12,8 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
 
 import time
-from collections import deque
+import heapq
+# from collections import deque
 from enum import Enum, auto
 
 # not true reachability limits, they just filter out obviously impossible targets
@@ -55,7 +56,11 @@ class IKMoveNode(Node):
 
         self.state = ArmState.IDLE
         self.publish_state()
-        self.command_queue = deque()
+        # self.command_queue = deque()
+        self.command_queue = []
+        self.command_counter = 0
+        # self.preempted = False
+        self.current_goal_id = 0
         self.create_timer(0.05, self.process_queue)
 
         self.target_pose = self.get_current_pose()
@@ -91,13 +96,28 @@ class IKMoveNode(Node):
 
         self.get_logger().info("IK Move Node ready")
 
+    def enqueue_command(self, priority, cmd_type, data):
+        self.command_counter += 1
+
+        if self.state == ArmState.EXECUTING and priority == 1:
+            if hasattr(self, "active_goal_handle"):
+                self.get_logger().info("Preempting current motion")
+                self.active_goal_handle.cancel_goal_async()
+                # self.preempted = True
+
+            self.state = ArmState.IDLE
+            self.publish_state()
+        
+        heapq.heappush(self.command_queue, (priority, self.command_counter, cmd_type, data))
+
     def process_queue(self):
         if self.state != ArmState.IDLE:
             return
         if not self.command_queue:
             return
         
-        cmd_type, data = self.command_queue.popleft()
+        # cmd_type, data = self.command_queue.popleft()
+        priority, _, cmd_type, data = heapq.heappop(self.command_queue) 
 
         self.state = ArmState.PLANNING
         self.publish_state()
@@ -125,7 +145,8 @@ class IKMoveNode(Node):
             return
         
         import copy
-        self.command_queue.append(("pose", copy.deepcopy(self.target_pose)))
+        # self.command_queue.append(("pose", copy.deepcopy(self.target_pose)))
+        self.enqueue_command(1, "pose", copy.deepcopy(self.target_pose))
 
     def orientation_callback(self, msg: Bool):
         self.orientation_enabled = msg.data
@@ -140,11 +161,13 @@ class IKMoveNode(Node):
             # self.target_pose = self.named_poses[msg.data]
             import copy
             self.target_pose = copy.deepcopy(self.named_poses[msg.data])
-            self.command_queue.append(("pose", self.target_pose))
+            # self.command_queue.append(("pose", self.target_pose))
+            self.enqueue_command(2, "pose", self.target_pose)
             return
         
         if name in self.named_joint_poses:
-            self.command_queue.append(("joint", self.named_joint_poses[name]))
+            # self.command_queue.append(("joint", self.named_joint_poses[name]))
+            self.enqueue_command(2, "joint", self.named_joint_poses[name])
             return
         
         if name not in self.named_poses and name not in self.named_joint_poses:
@@ -177,20 +200,36 @@ class IKMoveNode(Node):
 
         if not res or not res.pose_stamped:
             self.get_logger().warn("FK failed")
+
+            self.state = ArmState.ERROR
+            self.publish_state()
+
+            self.state = ArmState.IDLE
+            self.publish_state()
             return
         
         pose = res.pose_stamped[0]
 
         if not is_plausible_target(pose.pose.position):
             self.get_logger().warn("FK pose outside workspace, ignoring")
+
+            self.state = ArmState.ERROR
+            self.publish_state()
+
+            self.state = ArmState.IDLE
+            self.publish_state()
             return
         
-        self.command_queue.appendleft(("pose", pose))
+        # self.command_queue.appendleft(("pose", pose))
+        self.enqueue_command(1, "pose", pose)
 
         self.state = ArmState.IDLE
         self.publish_state()
     
     def send_ik_goal(self, pose: PoseStamped):
+        self.current_goal_id += 1
+        goal_id = self.current_goal_id
+
         pose.header.stamp = self.get_clock().now().to_msg()
 
         goal = MoveGroup.Goal()
@@ -233,10 +272,13 @@ class IKMoveNode(Node):
 
         self.get_logger().info('Sending IK + planning goal...')
         send_future = self.client.send_goal_async(goal)
-        send_future.add_done_callback(self.goal_response_callback)
+        # send_future.add_done_callback(self.goal_response_callback)
+        send_future.add_done_callback(lambda future: self.goal_response_callback(future, goal_id))
 
-    def goal_response_callback(self, future):
+    def goal_response_callback(self, future, goal_id):
         goal_handle = future.result()
+        
+        self.active_goal_handle = goal_handle
 
         if not goal_handle.accepted:
             self.state = ArmState.ERROR
@@ -250,9 +292,18 @@ class IKMoveNode(Node):
         self.publish_state()
         self.get_logger().info("IK goal accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self.ik_result_callback)
+        # result_future.add_done_callback(self.ik_result_callback)
+        result_future.add_done_callback(lambda future: self.ik_result_callback(future, goal_id))
 
-    def ik_result_callback(self, future):
+    def ik_result_callback(self, future, goal_id):
+        if goal_id != self.current_goal_id:
+            self.get_logger().info("Ignoring old goal result")
+            return
+        # if self.preempted:
+        #     self.get_logger().info("result ignored due to preemption")
+        #     self.preempted = False
+        #     return
+        
         result = future.result().result
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
             self.state = ArmState.ERROR
@@ -275,17 +326,6 @@ class IKMoveNode(Node):
             self.publish_state()
 
             self.get_logger().warn("empty trajectory")
-
-            return
-
-        if not result.planned_trajectory.joint_trajectory.points:
-            self.state = ArmState.ERROR
-            self.publish_state()
-
-            self.state = ArmState.IDLE
-            self.publish_state()
-
-            self.get_logger().info("Empty trajectory")
 
             return
 
