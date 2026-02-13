@@ -13,7 +13,7 @@ from trajectory_msgs.msg import JointTrajectory
 
 import time
 from collections import deque
-
+from enum import Enum, auto
 
 # not true reachability limits, they just filter out obviously impossible targets
 X_MIN, X_MAX = -0.3575, 0.3575
@@ -26,6 +26,12 @@ def is_plausible_target(p):
         Y_MIN <= p.y <= Y_MAX and
         Z_MIN <= p.z <= Z_MAX
     )
+
+class ArmState(Enum):
+    IDLE = auto()
+    PLANNING = auto()
+    EXECUTING = auto()
+    ERROR = auto()
 
 class IKMoveNode(Node):
     def __init__(self):
@@ -46,15 +52,14 @@ class IKMoveNode(Node):
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
         self.state_pub = self.create_publisher(String, "/arm/execution_state", 10)
 
-        self.execution_state = "IDLE"
+
+        self.state = ArmState.IDLE
         self.publish_state()
+        self.command_queue = deque()
+        self.create_timer(0.05, self.process_queue)
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
-
-        self.command_queue = deque()
-        self.busy = False
-        self.create_timer(0.05, self.process_queue)
         
         self.named_poses = {
             'home' : PoseStamped(header=self.make_header(),pose=self.make_pose(0.0032001789659261703, -1.795403477444779e-05, 0.4174376428127289)),
@@ -87,13 +92,15 @@ class IKMoveNode(Node):
         self.get_logger().info("IK Move Node ready")
 
     def process_queue(self):
-        if self.busy:
+        if self.state != ArmState.IDLE:
             return
         if not self.command_queue:
             return
         
         cmd_type, data = self.command_queue.popleft()
-        self.busy = True
+
+        self.state = ArmState.PLANNING
+        self.publish_state()
 
         if cmd_type == "pose":
             self.send_ik_goal(data)
@@ -102,7 +109,7 @@ class IKMoveNode(Node):
 
     def publish_state(self):
         msg = String()
-        msg.data = self.execution_state
+        msg.data = self.state.name
         self.state_pub.publish(msg)
 
     def delta_callback(self, msg: Vector3):
@@ -117,7 +124,6 @@ class IKMoveNode(Node):
             self.get_logger().warn("Target outside workspace, ignoring")
             return
         
-        # self.send_ik_goal(self.target_pose)
         import copy
         self.command_queue.append(("pose", copy.deepcopy(self.target_pose)))
 
@@ -134,12 +140,10 @@ class IKMoveNode(Node):
             # self.target_pose = self.named_poses[msg.data]
             import copy
             self.target_pose = copy.deepcopy(self.named_poses[msg.data])
-            # self.send_ik_goal(self.target_pose)
             self.command_queue.append(("pose", self.target_pose))
             return
         
         if name in self.named_joint_poses:
-            # self.joint_pose_to_fk_and_plan(self.named_joint_poses[name])
             self.command_queue.append(("joint", self.named_joint_poses[name]))
             return
         
@@ -181,9 +185,10 @@ class IKMoveNode(Node):
             self.get_logger().warn("FK pose outside workspace, ignoring")
             return
         
-        # self.send_ik_goal(pose)
         self.command_queue.appendleft(("pose", pose))
-        self.busy = False
+
+        self.state = ArmState.IDLE
+        self.publish_state()
     
     def send_ik_goal(self, pose: PoseStamped):
         pose.header.stamp = self.get_clock().now().to_msg()
@@ -234,12 +239,14 @@ class IKMoveNode(Node):
         goal_handle = future.result()
 
         if not goal_handle.accepted:
-            self.execution_state = "FAILED"
+            self.state = ArmState.ERROR
+            self.publish_state()
+            self.state = ArmState.IDLE
             self.publish_state()
             self.get_logger().warn("IK goal rejected")
             return
 
-        self.execution_state = "EXECUTING"
+        self.state = ArmState.EXECUTING
         self.publish_state()
         self.get_logger().info("IK goal accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
@@ -248,34 +255,44 @@ class IKMoveNode(Node):
     def ik_result_callback(self, future):
         result = future.result().result
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
-            self.execution_state = "FAILED"
+            self.state = ArmState.ERROR
             self.publish_state()
+
+            self.state = ArmState.IDLE
+            self.publish_state()
+
             self.get_logger().warn(f"IK planning failed with code {result.error_code.val}")
-            self.busy = False
+
             return
         
         trajectory = result.planned_trajectory.joint_trajectory
 
         if not trajectory.points:
-            self.execution_state = "FAILED"
+            self.state = ArmState.ERROR
             self.publish_state()
+
+            self.state = ArmState.IDLE
+            self.publish_state()
+
             self.get_logger().warn("empty trajectory")
-            self.busy = False
+
             return
 
         if not result.planned_trajectory.joint_trajectory.points:
-            self.execution_state = "FAILED"
+            self.state = ArmState.ERROR
             self.publish_state()
+
+            self.state = ArmState.IDLE
+            self.publish_state()
+
             self.get_logger().info("Empty trajectory")
-            self.busy = False
+
             return
 
-        self.execution_state = "SUCCEEDED"
+        self.state = ArmState.IDLE
         self.publish_state()
         self.traj_pub.publish(trajectory)
         self.get_logger().info("Published joint trajectory")
-        
-        self.busy = False
 
     def get_current_pose(self):
         ps = PoseStamped()
