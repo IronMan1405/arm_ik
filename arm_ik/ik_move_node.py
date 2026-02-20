@@ -9,7 +9,7 @@ from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstrai
 from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 import time
 import heapq
@@ -49,10 +49,14 @@ class IKMoveNode(Node):
         self.create_subscription(Vector3, "/arm/teleop_delta", self.delta_callback, 10)
         self.create_subscription(Bool, "/arm/orientation_constraint", self.orientation_callback, 10)
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
+        self.create_subscription(Bool, '/arm/emergency_stop', self.emergency_callback, 10)
+        self.create_subscription(JointState, '/joint_states', self.jointstate_callback, 10)
 
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
         self.state_pub = self.create_publisher(String, "/arm/execution_state", 10)
+        self.stop_traj_pub = self.create_publisher(JointTrajectory, '/arm_controller/joint_trajectory', 10)
 
+        self.emergency = False
 
         self.state = ArmState.IDLE
         self.publish_state()
@@ -62,6 +66,8 @@ class IKMoveNode(Node):
         # self.preempted = False
         self.current_goal_id = 0
         self.create_timer(0.05, self.process_queue)
+
+        self.latest_joint_state = None
 
         self.target_pose = self.get_current_pose()
         self.orientation_enabled = False
@@ -111,6 +117,9 @@ class IKMoveNode(Node):
         heapq.heappush(self.command_queue, (priority, self.command_counter, cmd_type, data))
 
     def process_queue(self):
+        if self.emergency:
+            return
+
         if self.state != ArmState.IDLE:
             return
         if not self.command_queue:
@@ -127,10 +136,59 @@ class IKMoveNode(Node):
         if cmd_type == "joint":
             self.joint_pose_to_fk_and_plan(data)
 
+    def jointstate_callback(self, msg: JointState):
+        self.latest_joint_state = msg
+
     def publish_state(self):
         msg = String()
         msg.data = self.state.name
         self.state_pub.publish(msg)
+
+    def publish_current_state_as_trajectory(self):
+        if not hasattr(self, 'latest_joint_state'):
+            return
+        
+        traj = JointTrajectory()
+        traj.joint_names = self.latest_joint_state.name
+        
+        point = JointTrajectoryPoint()
+        point.positions = list(self.latest_joint_state.position)
+        point.time_from_start.sec = 0
+        
+        traj.points.append(point)
+        self.stop_traj_pub.publish(traj)
+
+    def emergency_callback(self, msg: Bool):
+        self.emergency = msg.data
+
+        if self.emergency:
+            self.get_logger().warn("EMERGENCY STOP ACTIVATED! Cancelling active trajectory...")
+
+            if hasattr(self, "active_goal_handle"):
+                self.active_goal_handle.cancel_goal_async()
+
+            self.command_queue.clear()
+
+            self.publish_current_state_as_trajectory()
+            if hasattr(self, 'latest_joint_state'):
+                self.freeze_rviz()
+                self.get_logger().info('RViz frozen at current joints')
+        
+            self.state = ArmState.IDLE
+            self.publish_state()
+
+
+    # freezes rviz by sending current joint state as target end
+    # def freeze_rviz(self):
+    #     traj = JointTrajectory()
+    #     traj.joint_names = self.latest_joint_state.name
+        
+    #     point = JointTrajectoryPoint()
+    #     point.positions = self.latest_joint_state.position
+    #     point.time_from_start.sec = 0
+        
+    #     traj.points.append(point)
+    #     self.traj_pub.publish(traj)
 
     def delta_callback(self, msg: Vector3):
         if self.target_pose is None:
@@ -184,6 +242,9 @@ class IKMoveNode(Node):
     #     self.get_logger().info(f"Published joint pose: {joint_map}")
 
     def joint_pose_to_fk_and_plan(self, joint_map):
+        if self.emergency:
+            return
+        
         req = GetPositionFK.Request()
         req.header.frame_id = 'base_link'
         req.fk_link_names = ['end_effector_link']
@@ -196,6 +257,9 @@ class IKMoveNode(Node):
         future.add_done_callback(self.fk_callback)
 
     def fk_callback(self, future):
+        if self.emergency:
+            return
+        
         res = future.result()
 
         if not res or not res.pose_stamped:
@@ -227,6 +291,9 @@ class IKMoveNode(Node):
         self.publish_state()
     
     def send_ik_goal(self, pose: PoseStamped):
+        if self.emergency:
+            return
+        
         self.current_goal_id += 1
         goal_id = self.current_goal_id
 
@@ -276,6 +343,9 @@ class IKMoveNode(Node):
         send_future.add_done_callback(lambda future: self.goal_response_callback(future, goal_id))
 
     def goal_response_callback(self, future, goal_id):
+        if self.emergency:
+            return
+        
         goal_handle = future.result()
         
         self.active_goal_handle = goal_handle
@@ -296,6 +366,9 @@ class IKMoveNode(Node):
         result_future.add_done_callback(lambda future: self.ik_result_callback(future, goal_id))
 
     def ik_result_callback(self, future, goal_id):
+        if self.emergency:
+            return
+        
         if goal_id != self.current_goal_id:
             self.get_logger().info("Ignoring old goal result")
             return
