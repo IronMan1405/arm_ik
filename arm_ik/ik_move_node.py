@@ -5,15 +5,13 @@ from rclpy.action import ActionClient
 from geometry_msgs.msg import PoseStamped, Vector3
 from std_msgs.msg import Bool, String
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import Constraints, PositionConstraint, OrientationConstraint, MoveItErrorCodes, RobotState
+from moveit_msgs.msg import Constraints, JointConstraint, PositionConstraint, OrientationConstraint, MoveItErrorCodes, RobotState
 from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-import time
-import heapq
-# from collections import deque
+import math, time, heapq
 from enum import Enum, auto
 
 # not true reachability limits, they just filter out obviously impossible targets
@@ -29,6 +27,7 @@ def is_plausible_target(p):
     )
 
 class ArmState(Enum):
+    INITIALIZING = auto()
     IDLE = auto()
     PLANNING = auto()
     EXECUTING = auto()
@@ -58,12 +57,10 @@ class IKMoveNode(Node):
 
         self.emergency = False
 
-        self.state = ArmState.IDLE
+        self.state = ArmState.INITIALIZING
         self.publish_state()
-        # self.command_queue = deque()
         self.command_queue = []
         self.command_counter = 0
-        # self.preempted = False
         self.current_goal_id = 0
         self.create_timer(0.05, self.process_queue)
 
@@ -100,7 +97,20 @@ class IKMoveNode(Node):
             }
         }
 
+        self.init_joint_names =["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+        self.init_joint_positions = [
+            math.radians(0),
+            math.radians(20),
+            math.radians(-20),
+            math.radians(0),
+            math.radians(0),
+            math.radians(0)
+        ]
+
         self.get_logger().info("IK Move Node ready")
+
+        self.wait_for_initial_state()
+        self.move_to_home()
 
     def enqueue_command(self, priority, cmd_type, data):
         self.command_counter += 1
@@ -124,8 +134,7 @@ class IKMoveNode(Node):
             return
         if not self.command_queue:
             return
-        
-        # cmd_type, data = self.command_queue.popleft()
+
         priority, _, cmd_type, data = heapq.heappop(self.command_queue) 
 
         self.state = ArmState.PLANNING
@@ -138,6 +147,14 @@ class IKMoveNode(Node):
 
     def jointstate_callback(self, msg: JointState):
         self.latest_joint_state = msg
+
+    def wait_for_initial_state(self):
+        self.get_logger().info("Waiting for joint states...")
+
+        while rclpy.ok() and self.latest_joint_state is None:
+            rclpy.spin_once(self)
+        
+        self.get_logger().info("Intial joint state recieved.")
 
     def publish_state(self):
         msg = String()
@@ -203,7 +220,6 @@ class IKMoveNode(Node):
             return
         
         import copy
-        # self.command_queue.append(("pose", copy.deepcopy(self.target_pose)))
         self.enqueue_command(1, "pose", copy.deepcopy(self.target_pose))
 
     def orientation_callback(self, msg: Bool):
@@ -216,15 +232,12 @@ class IKMoveNode(Node):
         name = msg.data
         
         if name in self.named_poses:
-            # self.target_pose = self.named_poses[msg.data]
             import copy
             self.target_pose = copy.deepcopy(self.named_poses[msg.data])
-            # self.command_queue.append(("pose", self.target_pose))
             self.enqueue_command(2, "pose", self.target_pose)
             return
         
         if name in self.named_joint_poses:
-            # self.command_queue.append(("joint", self.named_joint_poses[name]))
             self.enqueue_command(2, "joint", self.named_joint_poses[name])
             return
         
@@ -284,7 +297,6 @@ class IKMoveNode(Node):
             self.publish_state()
             return
         
-        # self.command_queue.appendleft(("pose", pose))
         self.enqueue_command(1, "pose", pose)
 
         self.state = ArmState.IDLE
@@ -339,7 +351,6 @@ class IKMoveNode(Node):
 
         self.get_logger().info('Sending IK + planning goal...')
         send_future = self.client.send_goal_async(goal)
-        # send_future.add_done_callback(self.goal_response_callback)
         send_future.add_done_callback(lambda future: self.goal_response_callback(future, goal_id))
 
     def goal_response_callback(self, future, goal_id):
@@ -362,7 +373,6 @@ class IKMoveNode(Node):
         self.publish_state()
         self.get_logger().info("IK goal accepted, waiting for result...")
         result_future = goal_handle.get_result_async()
-        # result_future.add_done_callback(self.ik_result_callback)
         result_future.add_done_callback(lambda future: self.ik_result_callback(future, goal_id))
 
     def ik_result_callback(self, future, goal_id):
@@ -372,10 +382,6 @@ class IKMoveNode(Node):
         if goal_id != self.current_goal_id:
             self.get_logger().info("Ignoring old goal result")
             return
-        # if self.preempted:
-        #     self.get_logger().info("result ignored due to preemption")
-        #     self.preempted = False
-        #     return
         
         result = future.result().result
         if result.error_code.val != MoveItErrorCodes.SUCCESS:
@@ -427,6 +433,42 @@ class IKMoveNode(Node):
         p.position.z = z
         p.orientation.w = 1.0
         return p
+    
+    def move_to_home(self):
+        if self.emergency:
+            self.get_logger().warn("Emergency active. skipping home motion.")
+            return
+        
+        self.current_goal_id += 1
+        goal_id = self.current_goal_id
+
+        goal = MoveGroup.Goal()
+
+        goal.request.group_name = 'arm'
+        goal.request.num_planning_attempts = 5
+        goal.request.allowed_planning_time = 2.0
+        goal.request.max_velocity_scaling_factor = 0.2
+        goal.request.max_acceleration_scaling_factor = 0.2
+
+        goal.request.start_state.joint_state = self.latest_joint_state
+
+        constraints = Constraints()
+
+        for name, position in zip(self.init_joint_names, self.init_joint_positions):
+            jc = JointConstraint()
+            jc.joint_name = name
+            jc.position = position
+            jc.tolerance_above = 0.01
+            jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            constraints.joint_constraints.append(jc)
+
+        goal.request.goal_constraints.append(constraints)
+
+        self.get_logger().info("Moving to Init Home pose...")
+
+        future = self.client.send_goal_async(goal)
+        future.add_done_callback(lambda duture: self.goal_response_callback(future, goal_id))
 
 def main():
     rclpy.init()
