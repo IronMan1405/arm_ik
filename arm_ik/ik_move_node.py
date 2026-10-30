@@ -14,6 +14,8 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import math, time, heapq
 from enum import Enum, auto
 
+from arm_ik.cartesian_planner import CartesianPlanner
+
 # not true reachability limits, they just filter out obviously impossible targets
 X_MIN, X_MAX = -0.3575, 0.3575
 Y_MIN, Y_MAX = -0.3575, 0.3575
@@ -54,6 +56,8 @@ class IKMoveNode(Node):
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
         self.state_pub = self.create_publisher(String, "/arm/execution_state", 10)
         self.stop_traj_pub = self.create_publisher(JointTrajectory, '/arm_controller/joint_trajectory', 10)
+
+        self.cartesian_planning = CartesianPlanner(self, 'arm', 'ee_link', 'base_link')
 
         self.emergency = False
 
@@ -193,7 +197,6 @@ class IKMoveNode(Node):
         
             self.state = ArmState.IDLE
             self.publish_state()
-
 
     # freezes rviz by sending current joint state as target end
     # def freeze_rviz(self):
