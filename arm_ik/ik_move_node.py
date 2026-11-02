@@ -52,12 +52,13 @@ class IKMoveNode(Node):
         self.create_subscription(String, "/arm/named_pose", self.named_pose_callback, 10)
         self.create_subscription(Bool, '/arm/emergency_stop', self.emergency_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.jointstate_callback, 10)
+        self.create_subscription(Bool, '/arm/test_cartesian', self.cartesian_test_trigger, 10)
 
         self.traj_pub = self.create_publisher(JointTrajectory, '/arm/joint_trajectory', 10)
         self.state_pub = self.create_publisher(String, "/arm/execution_state", 10)
         self.stop_traj_pub = self.create_publisher(JointTrajectory, '/arm_controller/joint_trajectory', 10)
 
-        self.cartesian_planning = CartesianPlanner(self, 'arm', 'ee_link', 'base_link')
+        self.cartesian_planning = CartesianPlanner(self, 'arm', 'end_effector_link', 'base_link')
 
         self.emergency = False
 
@@ -115,6 +116,12 @@ class IKMoveNode(Node):
 
         self.wait_for_initial_state()
         self.move_to_home()
+
+    # trigger cartesian test with
+    # ros2 topic pub --once /arm/test_cartesian std_msgs/msg/Bool "{data: true}"
+    def cartesian_test_trigger(self, msg):
+        if msg.data:
+            self.test_cartesian_motion(dz=-0.02)
 
     def enqueue_command(self, priority, cmd_type, data):
         self.command_counter += 1
@@ -472,6 +479,78 @@ class IKMoveNode(Node):
 
         future = self.client.send_goal_async(goal)
         future.add_done_callback(lambda duture: self.goal_response_callback(future, goal_id))
+
+    def test_cartesian_motion(self, dx=0.0, dy=0.0, dz=0.0):
+        if self.state != ArmState.IDLE:
+            self.get_logger().warning("Robot is not idle.")
+            return
+
+        if self.emergency:
+            return
+
+        if self.latest_joint_state is None:
+            self.get_logger().error("Joint state unavailable.")
+            return
+
+        req = GetPositionFK.Request()
+        req.header.frame_id = 'base_link'
+        req.fk_link_names = ['end_effector_link']
+
+        req.robot_state = RobotState()
+        req.robot_state.joint_state = self.latest_joint_state
+
+        future = self.fk_client.call_async(req)
+
+        future.add_done_callback(lambda future: self.cartesian_fk_callback(future, dx, dy, dz))
+
+    def cartesian_fk_callback(self, future, dx, dy, dz):
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().error(f"FK request failed: {e}")
+            return
+
+        if not response or not response.pose_stamped:
+            self.get_logger().error("Could not retrieve current EE pose.")
+            return
+
+        start_pose = response.pose_stamped[0].pose
+
+        import copy
+        target_pose = copy.deepcopy(start_pose)
+
+        target_pose.position.x += dx
+        target_pose.position.y += dy
+        target_pose.position.z += dz
+
+        if not is_plausible_target(target_pose.position):
+            self.get_logger().warning("Cartesian target outside workspace.")
+            return
+
+        waypoints = self.cartesian_planning.generate_waypoints(start_pose, target_pose, n_points=10)
+
+        start_state = RobotState()
+        start_state.joint_state = self.latest_joint_state
+
+        self.cartesian_planning.plan_cartesian_path(start_state, waypoints, self.cartesian_test_callback)
+
+    def cartesian_test_callback(self, response, error):
+        if error is not None:
+            self.get_logger().error(f"Cartesian planning error: {error}")
+            return
+
+        if not self.cartesian_planning.validate_response(response):
+            self.get_logger().warning("Cartesian planning unsuccessful.")
+            return
+
+        trajectory = response.solution.joint_trajectory
+
+        self.get_logger().info(f"Cartesian trajectory generated: "
+            f"{len(trajectory.points)} points."
+        )
+
+        self.traj_pub.publish(trajectory)
+        self.get_logger.info("Published Cartesian trajectory.")
 
 def main():
     rclpy.init()
